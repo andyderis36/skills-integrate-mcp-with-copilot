@@ -5,14 +5,30 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import asyncio
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.db import Base, engine, SessionLocal, Activity, Participant
+
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+
+# Create tables if they don't exist (FastAPI startup event)
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# Dependency for DB session
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -83,50 +99,79 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
-@app.get("/activities")
-def get_activities():
-    return activities
 
+from sqlalchemy.future import select
+from fastapi import status
+from typing import List, Dict
+from sqlalchemy import and_
+
+@app.get("/activities")
+async def get_activities(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Activity))
+    activities = result.scalars().all()
+    response = {}
+    for activity in activities:
+        participants_result = await db.execute(
+            select(Participant.email).where(Participant.activity_id == activity.id)
+        )
+        participants = [row[0] for row in participants_result.all()]
+        response[activity.name] = {
+            "description": activity.description,
+            "schedule": activity.schedule,
+            "max_participants": activity.max_participants,
+            "participants": participants
+        }
+    return response
+
+
+
+from sqlalchemy.exc import NoResultFound
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+async def signup_for_activity(activity_name: str, email: str, db: AsyncSession = Depends(get_db)):
     """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
+    # Find the activity
+    result = await db.execute(select(Activity).where(Activity.name == activity_name))
+    activity = result.scalar_one_or_none()
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
+    # Check if already signed up
+    participant_result = await db.execute(
+        select(Participant).where(
+            and_(Participant.activity_id == activity.id, Participant.email == email)
         )
+    )
+    if participant_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Add student
-    activity["participants"].append(email)
+    # Add participant
+    new_participant = Participant(activity_id=activity.id, email=email)
+    db.add(new_participant)
+    await db.commit()
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
+
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+async def unregister_from_activity(activity_name: str, email: str, db: AsyncSession = Depends(get_db)):
     """Unregister a student from an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
+    # Find the activity
+    result = await db.execute(select(Activity).where(Activity.name == activity_name))
+    activity = result.scalar_one_or_none()
+    if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is signed up
-    if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
+    # Find the participant
+    participant_result = await db.execute(
+        select(Participant).where(
+            and_(Participant.activity_id == activity.id, Participant.email == email)
         )
+    )
+    participant = participant_result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
 
-    # Remove student
-    activity["participants"].remove(email)
+    await db.delete(participant)
+    await db.commit()
     return {"message": f"Unregistered {email} from {activity_name}"}
